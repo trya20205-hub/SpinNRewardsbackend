@@ -1,5 +1,6 @@
 # main.py
 import os
+import sys
 import json
 import random
 import threading
@@ -7,41 +8,64 @@ import time
 from datetime import datetime
 from typing import Dict, Any
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import telebot
 
-# Optional: pymongo if MONGO_URI provided
-MONGO_URI = os.getenv("MONGO_URI")
-
-if MONGO_URI:
-    from pymongo import MongoClient
-    client = MongoClient(MONGO_URI)
-    db = client.get_database("spinnrewards_db")
-    users_col = db.get_collection("users")
-else:
-    users_col = None
-
-# envs (Railway/Render/Heroku -> set these in project settings)
+# -------------------------
+# Config / Environment
+# -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
+    # Fail early on platforms like Railway so you set the secret properly
     raise RuntimeError("BOT_TOKEN not set in environment")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+MONGO_URI = os.getenv("MONGO_URI")  # optional
 
-# Reward economy (use your numbers)
+# Reward economy
 REWARD_POOL = [(0, 20), (300, 35), (500, 27), (800, 10), (1000, 5), (1500, 3)]
 
-# Local file fallback (not recommended for production)
+# Local file (fallback only)
 DATA_FILE = "users.json"
 
-# --- Flask app (health) ---
+# -------------------------
+# Optional MongoDB setup
+# -------------------------
+users_col = None
+if MONGO_URI:
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(MONGO_URI)
+        # Use a clear DB name
+        db = client.get_database("spinnrewards_db")
+        users_col = db.get_collection("users")
+        print("✅ Connected to MongoDB")
+    except Exception as e:
+        print("⚠️ Failed to connect to MongoDB:", e, file=sys.stderr)
+        users_col = None
+
+# -------------------------
+# Flask app (Railway expects an HTTP app)
+# -------------------------
 app = Flask(__name__)
 
 @app.route("/")
 def index():
     return jsonify({"ok": True, "msg": "SpinNRewards backend is running"})
 
-# --- Helper functions for storage ---
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
+
+# (Optional) a POST webhook endpoint placeholder if you later use webhooks
+@app.route("/webhook", methods=["POST"])
+def webhook_receiver():
+    # Keep minimal; not used in current polling mode
+    return jsonify({"received": True}), 200
+
+# -------------------------
+# File helpers (fallback)
+# -------------------------
 def load_users_file() -> Dict[str, Any]:
     if os.path.exists(DATA_FILE):
         try:
@@ -55,28 +79,38 @@ def save_users_file(users: Dict[str, Any]):
     with open(DATA_FILE, "w") as f:
         json.dump(users, f, indent=2)
 
+# -------------------------
+# DB helpers (Mongo)
+# -------------------------
 def user_from_db(uid: str) -> Dict[str, Any]:
+    if not users_col:
+        return None
     doc = users_col.find_one({"user_id": int(uid)})
     if doc:
-        # keep backwards-compatible shape
         doc.pop("_id", None)
         return doc
     return None
 
 def upsert_user_db(uid: str, payload: Dict[str, Any]):
-    payload["user_id"] = int(uid)
-    users_col.update_one({"user_id": int(uid)}, {"$set": payload}, upsert=True)
+    if not users_col:
+        return
+    payload_copy = dict(payload)
+    payload_copy["user_id"] = int(uid)
+    users_col.update_one({"user_id": int(uid)}, {"$set": payload_copy}, upsert=True)
 
-# --- In-memory / file storage fallback ---
+# -------------------------
+# In-memory / file fallback
+# -------------------------
 _users_cache = load_users_file()
 
 def get_user(uid: str) -> Dict[str, Any]:
     uid = str(uid)
+    # Use Mongo if available
     if users_col:
         doc = user_from_db(uid)
         if doc:
             return doc
-        # create default if missing
+        # create default in DB
         default = {
             "user_id": int(uid),
             "coins": 0,
@@ -91,26 +125,25 @@ def get_user(uid: str) -> Dict[str, Any]:
         }
         upsert_user_db(uid, default)
         return default
-    else:
-        if uid not in _users_cache:
-            _users_cache[uid] = {
-                "coins": 0,
-                "spins": 3,
-                "last_spin_time": 0,
-                "ref_by": None,
-                "refs": [],
-                "daily_refs": [],
-                "weekly_refs": [],
-                "task_pending": [],
-                "task_done": []
-            }
-            save_users_file(_users_cache)
-        return _users_cache[uid]
+    # fallback to JSON cache
+    if uid not in _users_cache:
+        _users_cache[uid] = {
+            "coins": 0,
+            "spins": 3,
+            "last_spin_time": 0,
+            "ref_by": None,
+            "refs": [],
+            "daily_refs": [],
+            "weekly_refs": [],
+            "task_pending": [],
+            "task_done": []
+        }
+        save_users_file(_users_cache)
+    return _users_cache[uid]
 
 def save_user(uid: str, user_obj: Dict[str, Any]):
     uid = str(uid)
     if users_col:
-        # remove user_id from doc to avoid conflict, will be set in upsert
         copy = dict(user_obj)
         copy.pop("user_id", None)
         upsert_user_db(uid, copy)
@@ -118,30 +151,31 @@ def save_user(uid: str, user_obj: Dict[str, Any]):
         _users_cache[uid] = user_obj
         save_users_file(_users_cache)
 
-# --- utility to draw reward according to weights ---
+# -------------------------
+# Reward drawing helper
+# -------------------------
 def draw_reward() -> int:
     choices = []
     for val, weight in REWARD_POOL:
         choices.extend([val] * weight)
     return random.choice(choices)
 
-# --- Telegram bot ---
+# -------------------------
+# Telegram bot and handlers
+# -------------------------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     uid = str(message.from_user.id)
     user = get_user(uid)
-    # referral handling: /start <ref>
     parts = message.text.split()
     if len(parts) > 1:
         ref = parts[1]
         try:
             if ref != uid:
                 ref_user = get_user(ref)
-                # prevent self-ref & duplicates & limits
-                if uid not in ref_user["refs"]:
-                    # limit daily/weekly handled lightly here
+                if uid not in ref_user.get("refs", []):
                     if len(ref_user.get("daily_refs", [])) < 5 and len(ref_user.get("weekly_refs", [])) < 40:
                         ref_user["refs"].append(uid)
                         ref_user.setdefault("daily_refs", []).append(uid)
@@ -235,12 +269,10 @@ def cmd_leaderboard(message):
 def cmd_submit(message):
     uid = str(message.from_user.id)
     user = get_user(uid)
-    # mark a pending task (for now we just note user id)
     if uid not in user.get("task_pending", []):
         user.setdefault("task_pending", []).append(uid)
         save_user(uid, user)
         bot.send_message(message.chat.id, "✅ Task submitted. Awaiting admin approval.")
-        # notify admin
         try:
             bot.send_message(ADMIN_ID, f"🔔 User {message.from_user.first_name} submitted a task. Approve with /approvetask {uid}")
         except Exception:
@@ -257,7 +289,7 @@ def cmd_approvetask(message):
     uid = parts[1]
     user = get_user(uid)
     if uid in user.get("task_pending", []):
-        reward = 500  # default task reward (you can change later)
+        reward = 500
         user["coins"] = user.get("coins", 0) + reward
         user["task_pending"].remove(uid)
         user.setdefault("task_done", []).append(uid)
@@ -320,27 +352,34 @@ def cmd_broadcast(message):
                 pass
     bot.send_message(message.chat.id, "📣 Broadcast sent (attempted).")
 
-# --- Start bot thread at import time so gunicorn main:app will create it ---
+# -------------------------
+# Start bot in background thread (safe startup)
+# -------------------------
 def _start_bot_thread():
-    t = threading.Thread(target=bot.infinity_polling, kwargs={"timeout": 60, "long_polling_timeout": 60})
-    t.daemon = True
+    def _run():
+        # Use infinity_polling which reconnects automatically
+        try:
+            print("🔁 Starting bot.infinity_polling() ...")
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print("Bot polling stopped with exception:", e, file=sys.stderr)
+
+    t = threading.Thread(target=_run, daemon=True)
     t.start()
 
-# ensure we start only once
+# Start once (guard)
 if "BOT_THREAD_STARTED" not in globals():
-    _start_bot_thread()
-    BOT_THREAD_STARTED = True
+    # Optional: allow disabling thread via env (for testing)
+    if os.getenv("DISABLE_BOT_THREAD", "0") != "1":
+        _start_bot_thread()
+        BOT_THREAD_STARTED = True
 
-# Optionally - webhook setup (not used here):
-# To switch to webhooks, remove polling and add a Flask route to receive updates,
-# then call bot.remove_webhook() and bot.set_webhook(url="https://your-railway-url/webhook")
-# Example (very brief):
-#
-# @app.route("/webhook", methods=["POST"])
-# def webhook():
-#     json_data = request.get_data().decode("utf-8")
-#     update = telebot.types.Update.de_json(json_data)
-#     bot.process_new_updates([update])
-#     return "", 200
-#
-# Then you must set webhook manually with bot.set_webhook or via Telegram API.
+# -------------------------
+# If run directly (dev), start flask + bot in foreground
+# -------------------------
+if __name__ == "__main__":
+    # In dev you might want to run both on the same process
+    print("Starting Flask dev server (main) and bot thread...")
+    if os.getenv("DISABLE_BOT_THREAD", "0") != "1":
+        _start_bot_thread()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
