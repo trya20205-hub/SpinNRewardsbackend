@@ -383,3 +383,5 @@ if __name__ == "__main__":
     if os.getenv("DISABLE_BOT_THREAD", "0") != "1":
         _start_bot_thread()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+
+# restore
