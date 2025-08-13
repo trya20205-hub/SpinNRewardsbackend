@@ -1,9 +1,8 @@
-# main.py
+# main.py  — webhook version for Render/any host
 import os
 import sys
 import json
 import random
-import threading
 import time
 from datetime import datetime
 from typing import Dict, Any
@@ -16,7 +15,6 @@ import telebot
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    # Fail early on platforms like Railway so you set the secret properly
     raise RuntimeError("BOT_TOKEN not set in environment")
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -36,7 +34,6 @@ if MONGO_URI:
     try:
         from pymongo import MongoClient
         client = MongoClient(MONGO_URI)
-        # Use a clear DB name
         db = client.get_database("spinnrewards_db")
         users_col = db.get_collection("users")
         print("✅ Connected to MongoDB")
@@ -45,7 +42,7 @@ if MONGO_URI:
         users_col = None
 
 # -------------------------
-# Flask app (Railway expects an HTTP app)
+# Flask app
 # -------------------------
 app = Flask(__name__)
 
@@ -56,12 +53,6 @@ def index():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
-
-# (Optional) a POST webhook endpoint placeholder if you later use webhooks
-@app.route("/webhook", methods=["POST"])
-def webhook_receiver():
-    # Keep minimal; not used in current polling mode
-    return jsonify({"received": True}), 200
 
 # -------------------------
 # File helpers (fallback)
@@ -235,7 +226,6 @@ def cmd_myrefs(message):
 
 @bot.message_handler(commands=["referralboard"])
 def cmd_referralboard(message):
-    # fetch all users (DB) or from cache and sort
     if users_col:
         board = list(users_col.find({}, {"user_id": 1, "refs": 1}))
         board_sorted = sorted(board, key=lambda d: len(d.get("refs", [])), reverse=True)[:10]
@@ -264,7 +254,6 @@ def cmd_leaderboard(message):
             msg += f"{i}. {uid} - {data.get('coins',0)} coins\n"
     bot.send_message(message.chat.id, msg)
 
-# --- Task submission & admin approval (semi-automatic) ---
 @bot.message_handler(commands=["submit"])
 def cmd_submit(message):
     uid = str(message.from_user.id)
@@ -299,15 +288,11 @@ def cmd_approvetask(message):
     else:
         bot.send_message(message.chat.id, "❌ No pending task found for that user.")
 
-# --- Admin commands ---
 @bot.message_handler(commands=["userstats"])
 def cmd_userstats(message):
     if message.from_user.id != ADMIN_ID:
         return
-    if users_col:
-        total = users_col.count_documents({})
-    else:
-        total = len(_users_cache)
+    total = users_col.count_documents({}) if users_col else len(_users_cache)
     bot.send_message(message.chat.id, f"📊 Total Users: {total}")
 
 @bot.message_handler(commands=["setcoins"])
@@ -353,35 +338,40 @@ def cmd_broadcast(message):
     bot.send_message(message.chat.id, "📣 Broadcast sent (attempted).")
 
 # -------------------------
-# Start bot in background thread (safe startup)
+# Webhook endpoint (Telegram -> your app)
 # -------------------------
-def _start_bot_thread():
-    def _run():
-        # Use infinity_polling which reconnects automatically
-        try:
-            print("🔁 Starting bot.infinity_polling() ...")
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            print("Bot polling stopped with exception:", e, file=sys.stderr)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
-# Start once (guard)
-if "BOT_THREAD_STARTED" not in globals():
-    # Optional: allow disabling thread via env (for testing)
-    if os.getenv("DISABLE_BOT_THREAD", "0") != "1":
-        _start_bot_thread()
-        BOT_THREAD_STARTED = True
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    try:
+        update = telebot.types.Update.de_json(request.data.decode("utf-8"))
+        bot.process_new_updates([update])
+    except Exception as e:
+        print("Webhook processing error:", e, file=sys.stderr)
+    return "", 200
 
 # -------------------------
-# If run directly (dev), start flask + bot in foreground
+# Startup: set webhook (no polling)
 # -------------------------
+def set_webhook_on_start():
+    """
+    Render exposes the public hostname via RENDER_EXTERNAL_HOSTNAME.
+    We build the webhook URL: https://<host>/<BOT_TOKEN>
+    """
+    host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+    if not host:
+        print("⚠️ RENDER_EXTERNAL_HOSTNAME not set (only present on Render).", file=sys.stderr)
+        return
+    url = f"https://{host}/{BOT_TOKEN}"
+    try:
+        bot.remove_webhook()
+        if bot.set_webhook(url=url):
+            print(f"✅ Webhook set to {url}")
+        else:
+            print("⚠️ Failed to set webhook (Telegram returned False)", file=sys.stderr)
+    except Exception as e:
+        print("❌ Error setting webhook:", e, file=sys.stderr)
+
 if __name__ == "__main__":
-    # In dev you might want to run both on the same process
-    print("Starting Flask dev server (main) and bot thread...")
-    if os.getenv("DISABLE_BOT_THREAD", "0") != "1":
-        _start_bot_thread()
+    # IMPORTANT: no polling/threading here
+    set_webhook_on_start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
-# restore

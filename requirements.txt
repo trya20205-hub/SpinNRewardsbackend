@@ -3,3 +3,4 @@ pyTelegramBotAPI>=4.12
 pymongo>=4.5
 dnspython>=2.3
 gunicorn>=21.2
+python-dotenv
